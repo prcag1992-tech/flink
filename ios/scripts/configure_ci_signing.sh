@@ -1,4 +1,4 @@
-#!/bin/bash
+﻿#!/bin/bash
 # CI Manual Code Signing Script for iOS
 # Usage: bash ios/scripts/configure_ci_signing.sh
 
@@ -91,9 +91,9 @@ cat > "$EXPORT_PLIST" << PLISTEND
 	<string>manual</string>
 	<key>provisioningProfiles</key>
 	<dict>
-		<key>com.ava.vpnclient</key>
+		<key>com.netsignory.app</key>
 		<string>${APP_PROFILE_NAME}</string>
-		<key>com.ava.vpnclient.vpntunnel</key>
+		<key>com.netsignory.app.VPNTunnel</key>
 		<string>${EXT_PROFILE_NAME}</string>
 	</dict>
 	<key>stripSwiftSymbols</key>

@@ -1,4 +1,4 @@
-import Flutter
+﻿import Flutter
 import UIKit
 import os.log
 import CryptoKit
@@ -69,10 +69,9 @@ import SystemConfiguration
         }
     }
 
-    /// 扩展 Bundle ID：必须与 pbxproj 中 VPNTunnel target 的 PRODUCT_BUNDLE_IDENTIFIER 完全一致
-    /// （当前工程为 com.ava.vpnclient.vpntunnel，全小写）。
+    /// 扩展 Bundle ID：必须与 pbxproj 中 VPNTunnel 的 PRODUCT_BUNDLE_IDENTIFIER 完全一致
     private var tunnelBundleId: String {
-        (Bundle.main.bundleIdentifier ?? "com.ava.vpnclient") + ".vpntunnel"
+        "com.netsignory.app.VPNTunnel"
     }
 
     /// 返回一个可用的 Manager（复用已有，否则加载首个，都没有则新建）。
