@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+#!/bin/bash
 # CI Manual Code Signing Script for iOS
 # Usage: bash ios/scripts/configure_ci_signing.sh
 
