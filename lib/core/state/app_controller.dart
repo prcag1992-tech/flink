@@ -100,7 +100,7 @@ class AppController extends ChangeNotifier {
   static const _servicesKey = 'saved_services';
 
   // --- 分流全局开关 ---
-  bool splitRoutingEnabled = true;
+  bool splitRoutingEnabled = false;
   static const _splitToggleKey = 'split_routing_enabled';
 
   // --- 外部控制开关 ---
@@ -1270,7 +1270,7 @@ class AppController extends ChangeNotifier {
   Future<void> _loadToggles() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      splitRoutingEnabled = prefs.getBool(_splitToggleKey) ?? true;
+      splitRoutingEnabled = prefs.getBool(_splitToggleKey) ?? false;
       externalControlEnabled = prefs.getBool(_externalControlKey) ?? false;
       notifyListeners();
     } catch (e) {

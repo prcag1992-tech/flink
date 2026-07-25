@@ -13,7 +13,7 @@ abstract class VpnService {
     required String username,
     required String password,
     List<String> routes = const [],
-    bool splitRouting = true,
+    bool splitRouting = false,
   });
 
   Future<void> disconnect();

@@ -23,7 +23,7 @@ class MockVpnService implements VpnService {
     required String username,
     required String password,
     List<String> routes = const [],
-    bool splitRouting = true,
+    bool splitRouting = false,
   }) async {
     if (_current == VpnStatus.connected || _current == VpnStatus.connecting) {
       return;

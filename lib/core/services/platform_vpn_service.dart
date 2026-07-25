@@ -61,7 +61,7 @@ class PlatformVpnService implements VpnService {
     required String username,
     required String password,
     List<String> routes = const [],
-    bool splitRouting = true,
+    bool splitRouting = false,
   }) async {
     final endpoint = _normalizeEndpoint(node.url, node.port);
     final isWireGuard = protocol == VpnProtocol.wireguard;

@@ -92,13 +92,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
 
         let dns = (params["dnsServers"] as? [String]) ?? []
         let routes = (params["routes"] as? [String]) ?? []
-        let splitRouting = (params["splitRouting"] as? Bool) ?? true
+        // NSNumber / Bool 兼容；默认全隧道（分流关闭）
+        let splitRouting: Bool = {
+            if let b = params["splitRouting"] as? Bool { return b }
+            if let n = params["splitRouting"] as? NSNumber { return n.boolValue }
+            return false
+        }()
         fullTunnel = !splitRouting
         effectiveDns = dns
         effectiveRoutes = routes
 
-        os_log("startTunnel proto=%{public}@ server=%{public}@(%{public}@):%d split=%d routes=%d",
-               log: log, type: .info, proto, serverHost, serverIp, serverPort, splitRouting ? 1 : 0, routes.count)
+        os_log("startTunnel proto=%{public}@ server=%{public}@(%{public}@):%d split=%d fullTunnel=%d routes=%d",
+               log: log, type: .info, proto, serverHost, serverIp, serverPort,
+               splitRouting ? 1 : 0, fullTunnel ? 1 : 0, routes.count)
 
         if proto == "wireguard" {
             startWireGuard(params: params, completionHandler: completionHandler)
@@ -151,7 +157,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let tunnelConfig = buildWgConfig(
             server: serverIp, port: serverPort,
             serverPublicKey: serverPublicKey, clientPrivateKey: clientPrivateKey,
-            dnsServers: effectiveDns, clientIpAddress: clientIpAddress, routes: effectiveRoutes
+            dnsServers: effectiveDns, clientIpAddress: clientIpAddress,
+            routes: effectiveRoutes, fullTunnel: fullTunnel
         ) else {
             fail(&lastError, "WireGuard 配置解析失败（密钥格式错误）")
             completionHandler(NSError(domain: "VPN", code: -11,
@@ -183,7 +190,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         server: String, port: Int,
         serverPublicKey: String, clientPrivateKey: String,
         dnsServers: [String], clientIpAddress: String,
-        routes: [String]
+        routes: [String],
+        fullTunnel: Bool
     ) -> TunnelConfiguration? {
         guard let privateKey = PrivateKey(base64Key: clientPrivateKey),
               let publicKey = PublicKey(base64Key: serverPublicKey) else {
@@ -210,20 +218,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         peer.endpoint = Endpoint(from: "\(server):\(port)")
         peer.persistentKeepAlive = 25
 
-        // AllowedIPs：给定分流路由则用之，否则全隧道 0.0.0.0/0。
-        // wg-go 会将自身 UDP socket 绑定物理接口，无需像安卓那样手动 CIDR 排除服务器 IP。
+        // AllowedIPs：全隧道固定 0.0.0.0/0；分流才用路由表（空路由时不要误装默认路由再缩回）
         var allowed: [IPAddressRange] = []
-        if !routes.isEmpty {
+        if fullTunnel {
+            if let v4 = IPAddressRange(from: "0.0.0.0/0") { allowed.append(v4) }
+        } else {
             for r in routes {
                 if let range = IPAddressRange(from: normalizeCidr(r)) { allowed.append(range) }
             }
-            // 分流模式下确保 DNS 走隧道
             for d in dnsServers {
                 if let range = IPAddressRange(from: "\(d)/32") { allowed.append(range) }
             }
-        }
-        if allowed.isEmpty {
-            if let v4 = IPAddressRange(from: "0.0.0.0/0") { allowed.append(v4) }
         }
         peer.allowedIPs = allowed
 
@@ -668,7 +673,8 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let tunnelConfig = buildWgConfig(
             server: serverIp, port: serverPort,
             serverPublicKey: serverPublicKey, clientPrivateKey: clientPrivateKey,
-            dnsServers: effectiveDns, clientIpAddress: clientIpAddress, routes: routes
+            dnsServers: effectiveDns, clientIpAddress: clientIpAddress,
+            routes: routes, fullTunnel: fullTunnel
         ) else { return }
         wgAdapter.update(tunnelConfiguration: tunnelConfig) { [weak self] error in
             if let error = error {
