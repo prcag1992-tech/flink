@@ -229,7 +229,7 @@ jobs:
             --build-name=${{ steps.ver.outputs.name }} \
             --build-number=${{ steps.ver.outputs.number }} \
             --export-options-plist=ios/ExportOptions.plist \
-            --dart-define=API_BASE_URL=https://api.netsignory.com
+            --dart-define=API_BASE_URL=https://client.gogogofuture.com
 
       # ── Validate IPA versions + MinimumOSVersion ──
       - name: Validate IPA versions

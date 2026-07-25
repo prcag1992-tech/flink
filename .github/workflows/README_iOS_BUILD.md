@@ -64,7 +64,7 @@
 
 | 变量名 | 用途 | 默认值 |
 |---|---|---|
-| `API_BASE_URL` | 后端 API 域名(通过 `--dart-define` 注入) | `https://api.netsignory.com` |
+| `API_BASE_URL` | 编译期默认后端（登录时会被用户填写的「服务地址」覆盖） | `https://client.gogogofuture.com` |
 
 ---
 

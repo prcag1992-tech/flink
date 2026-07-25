@@ -88,6 +88,10 @@ class HttpBackendRepository implements BackendRepository {
     required String username,
     required String password,
   }) async {
+    // 必须先绑定到用户填写的服务域名，否则会打到编译期 API_BASE_URL
+    //（例如错误的 https://api.netsignory.com 官网 → nginx 404）。
+    bindApiBase(liUrl);
+
     // Step 1: 拉取 Li 信息（直接响应，无 code/data 包裹）
     final liRes = await _apiClient.getJson(
       '/api/v1/li/info',
