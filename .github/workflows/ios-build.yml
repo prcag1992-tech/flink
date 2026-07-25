@@ -1,0 +1,386 @@
+name: iOS Build & Deploy
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      build_mode:
+        description: 'Build mode'
+        required: true
+        type: choice
+        default: 'unsigned'
+        options:
+          - unsigned
+          - adhoc
+          - appstore
+
+env:
+  WORKING_DIR: .
+  XCODE_VERSION: '26.5'
+  FLUTTER_VERSION: '3.41.3'
+  SCHEME: Runner
+
+jobs:
+  build:
+    name: Build iOS (${{ inputs.build_mode || 'unsigned' }})
+    runs-on: macos-26
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: ${{ env.WORKING_DIR }}
+
+    steps:
+      # ── Checkout ──
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Select Xcode 26 ──
+      - name: Select Xcode ${{ env.XCODE_VERSION }}
+        run: |
+          sudo xcode-select -s "/Applications/Xcode_${XCODE_VERSION}.app"
+          xcodebuild -version
+          SDK_VER=$(xcrun --sdk iphoneos --show-sdk-version)
+          echo "iOS SDK: $SDK_VER"
+          if echo "$SDK_VER" | grep -q "^26"; then
+            echo "[OK] iOS 26 SDK available"
+          else
+            echo "[ERROR] iOS 26 SDK not found - App Store will reject (90725)"
+            exit 1
+          fi
+
+      # ── Setup Flutter ──
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter pub get
+        run: flutter pub get
+
+      # ── CocoaPods ──
+      - name: Pod install
+        run: |
+          cd ios && pod install && cd ..
+
+      # ── Signing: Import Certificate ──
+      # Secret 名称兼容两套：BUILD_* / P12_*（README）与 IOS_*（填值文件）
+      - name: Import Signing Certificate
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        env:
+          BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 || secrets.IOS_DISTRIBUTION_CERT_P12_BASE64 }}
+          P12_PASSWORD: ${{ secrets.P12_PASSWORD || secrets.IOS_DISTRIBUTION_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD || secrets.IOS_KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$BUILD_CERTIFICATE_BASE64" ] || [ -z "$P12_PASSWORD" ] || [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "::error::Signing secrets are empty. Configure on repo Settings → Secrets → Actions:"
+            echo "  BUILD_CERTIFICATE_BASE64  (or IOS_DISTRIBUTION_CERT_P12_BASE64)"
+            echo "  P12_PASSWORD              (or IOS_DISTRIBUTION_CERT_PASSWORD)"
+            echo "  KEYCHAIN_PASSWORD         (or IOS_KEYCHAIN_PASSWORD)"
+            echo "Repo: https://github.com/prcag1992-tech/flink/settings/secrets/actions"
+            exit 1
+          fi
+          KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security default-keychain -s "$KEYCHAIN_PATH"
+          echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          CERT_SIZE=$(wc -c < "$RUNNER_TEMP/cert.p12" | tr -d ' ')
+          if [ "$CERT_SIZE" -lt 100 ]; then
+            echo "::error::Decoded p12 is too small (${CERT_SIZE} bytes). Check BUILD_CERTIFICATE_BASE64 / IOS_DISTRIBUTION_CERT_P12_BASE64."
+            exit 1
+          fi
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN_PATH" -P "$P12_PASSWORD" -A -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "[OK] Certificate imported (${CERT_SIZE} bytes)"
+
+      # ── Signing: Install Profiles ──
+      - name: Install Provisioning Profiles
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        env:
+          APP_PROFILE_BASE64: ${{ secrets.APP_PROFILE_BASE64 || secrets.IOS_APP_PROVISIONING_PROFILE_BASE64 }}
+          EXT_PROFILE_BASE64: ${{ secrets.EXT_PROFILE_BASE64 || secrets.IOS_EXT_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          if [ -z "$APP_PROFILE_BASE64" ] || [ -z "$EXT_PROFILE_BASE64" ]; then
+            echo "::error::Provisioning profile secrets are empty. Configure:"
+            echo "  APP_PROFILE_BASE64  (or IOS_APP_PROVISIONING_PROFILE_BASE64)"
+            echo "  EXT_PROFILE_BASE64  (or IOS_EXT_PROVISIONING_PROFILE_BASE64)"
+            exit 1
+          fi
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$APP_PROFILE_BASE64" | base64 --decode > $RUNNER_TEMP/app.mobileprovision
+          echo "$EXT_PROFILE_BASE64" | base64 --decode > $RUNNER_TEMP/ext.mobileprovision
+          echo "[OK] Profiles decoded"
+
+      # ── Signing: Configure ──
+      - name: Configure Manual Code Signing
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          APP_PROFILE_PATH: ${{ runner.temp }}/app.mobileprovision
+          EXT_PROFILE_PATH: ${{ runner.temp }}/ext.mobileprovision
+          EXPORT_METHOD: ${{ inputs.build_mode == 'adhoc' && 'ad-hoc' || 'app-store' }}
+        run: |
+          chmod +x ios/scripts/configure_ci_signing.sh
+          sed -i '' 's/\r$//' ios/scripts/configure_ci_signing.sh
+          bash ios/scripts/configure_ci_signing.sh
+
+      # ── Resolve + stamp version (literals into Info.plist; unique per CI run) ──
+      - name: Resolve app version
+        id: ver
+        run: |
+          set -euo pipefail
+          LINE=$(grep -E '^version:' pubspec.yaml | head -1 | awk '{print $2}' | tr -d '\r')
+          BUILD_NAME="${LINE%%+*}"
+          PUBSPEC_NUM="${LINE##*+}"
+          RUN_NUM="${{ github.run_number }}"
+          # Always beat App Store's last build (currently 19) and stay unique per run
+          RUN_BASED=$((1000 + RUN_NUM))
+          BUILD_NUMBER="$PUBSPEC_NUM"
+          if [[ "$RUN_BASED" -gt "$BUILD_NUMBER" ]]; then
+            BUILD_NUMBER="$RUN_BASED"
+          fi
+          if [[ -z "$BUILD_NAME" || -z "$BUILD_NUMBER" || "$BUILD_NAME" == "$LINE" ]]; then
+            echo "::error::Cannot parse pubspec version (got: $LINE)"
+            exit 1
+          fi
+          echo "name=$BUILD_NAME" >> "$GITHUB_OUTPUT"
+          echo "number=$BUILD_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "[OK] version => $BUILD_NAME+$BUILD_NUMBER (pubspec=$PUBSPEC_NUM run=$RUN_NUM commit=$(git rev-parse --short HEAD))"
+
+          # Stamp LITERALS into Info.plist — do not rely on $(FLUTTER_BUILD_*) expansion
+          for plist in ios/Runner/Info.plist ios/VPNTunnel/Info.plist; do
+            /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString ${BUILD_NAME}" "$plist"
+            /usr/libexec/PlistBuddy -c "Set :CFBundleVersion ${BUILD_NUMBER}" "$plist"
+            echo "── $plist ──"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$plist"
+            /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$plist"
+          done
+
+          # Keep Xcode MARKETING/CURRENT in sync for appex + Runner
+          ruby <<RUBY
+          require 'xcodeproj'
+          name = '${BUILD_NAME}'
+          number = '${BUILD_NUMBER}'
+          project = Xcodeproj::Project.open('ios/Runner.xcodeproj')
+          project.targets.each do |target|
+            next unless %w[Runner VPNTunnel].include?(target.name)
+            target.build_configurations.each do |config|
+              config.build_settings['MARKETING_VERSION'] = name
+              config.build_settings['CURRENT_PROJECT_VERSION'] = number
+            end
+          end
+          project.save
+          puts "[OK] pbxproj MARKETING_VERSION=#{name} CURRENT_PROJECT_VERSION=#{number}"
+          RUBY
+
+          # Flutter Generated.xcconfig (flutter may recreate; also pass --build-number)
+          mkdir -p ios/Flutter
+          if [[ -f ios/Flutter/Generated.xcconfig ]]; then
+            sed -i '' -E "s/^FLUTTER_BUILD_NAME=.*/FLUTTER_BUILD_NAME=${BUILD_NAME}/" ios/Flutter/Generated.xcconfig
+            sed -i '' -E "s/^FLUTTER_BUILD_NUMBER=.*/FLUTTER_BUILD_NUMBER=${BUILD_NUMBER}/" ios/Flutter/Generated.xcconfig
+            grep -q '^FLUTTER_BUILD_NAME=' ios/Flutter/Generated.xcconfig || echo "FLUTTER_BUILD_NAME=${BUILD_NAME}" >> ios/Flutter/Generated.xcconfig
+            grep -q '^FLUTTER_BUILD_NUMBER=' ios/Flutter/Generated.xcconfig || echo "FLUTTER_BUILD_NUMBER=${BUILD_NUMBER}" >> ios/Flutter/Generated.xcconfig
+          else
+            printf 'FLUTTER_BUILD_NAME=%s\nFLUTTER_BUILD_NUMBER=%s\n' "$BUILD_NAME" "$BUILD_NUMBER" > ios/Flutter/Generated.xcconfig
+          fi
+          grep -E 'FLUTTER_BUILD_(NAME|NUMBER)=' ios/Flutter/Generated.xcconfig || true
+
+      # ── Build IPA ──
+      - name: Build unsigned IPA
+        if: inputs.build_mode == 'unsigned'
+        run: |
+          flutter build ipa --release --no-codesign \
+            --build-name=${{ steps.ver.outputs.name }} \
+            --build-number=${{ steps.ver.outputs.number }}
+
+      - name: Build signed IPA
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        run: |
+          echo "── Verify manual signing before archive ──"
+          grep -n "PROVISIONING_PROFILE_SPECIFIER\|CODE_SIGN_STYLE\|DEVELOPMENT_TEAM" \
+            ios/Runner.xcodeproj/project.pbxproj | head -40
+          echo "── ExportOptions.plist ──"
+          cat ios/ExportOptions.plist
+          echo "── Forced version: ${{ steps.ver.outputs.name }}+${{ steps.ver.outputs.number }} ──"
+          echo "── Pre-build Info.plist versions ──"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" ios/Runner/Info.plist
+          /usr/libexec/PlistBuddy -c "Print :CFBundleVersion" ios/VPNTunnel/Info.plist
+          flutter build ipa --release \
+            --build-name=${{ steps.ver.outputs.name }} \
+            --build-number=${{ steps.ver.outputs.number }} \
+            --export-options-plist=ios/ExportOptions.plist \
+            --dart-define=API_BASE_URL=https://api.netsignory.com
+
+      # ── Validate IPA versions + MinimumOSVersion ──
+      - name: Validate IPA versions
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name "*.ipa" | head -1)
+          if [[ -z "$IPA_PATH" ]]; then
+            echo "[ERROR] IPA not found"
+            exit 1
+          fi
+          echo "IPA: $IPA_PATH"
+          TEMP_DIR=$(mktemp -d)
+          unzip -q "$IPA_PATH" -d "$TEMP_DIR"
+
+          expect_name="${{ steps.ver.outputs.name }}"
+          expect_num="${{ steps.ver.outputs.number }}"
+          check_plist() {
+            local label="$1" plist="$2"
+            if [[ ! -f "$plist" ]]; then
+              echo "::error::$label Info.plist missing: $plist"
+              exit 1
+            fi
+            local short ver
+            short=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$plist")
+            ver=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$plist")
+            echo "$label: CFBundleShortVersionString=$short CFBundleVersion=$ver"
+            if [[ "$short" != "$expect_name" || "$ver" != "$expect_num" ]]; then
+              echo "::error::$label version mismatch: got $short+$ver, expected $expect_name+$expect_num"
+              exit 1
+            fi
+          }
+          check_plist "Runner" "$TEMP_DIR/Payload/Runner.app/Info.plist"
+          check_plist "VPNTunnel" "$TEMP_DIR/Payload/Runner.app/PlugIns/VPNTunnel.appex/Info.plist"
+
+          APP_FW_PLIST="$TEMP_DIR/Payload/Runner.app/Frameworks/App.framework/Info.plist"
+          if [[ -f "$APP_FW_PLIST" ]]; then
+            MIN_OS=$(/usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP_FW_PLIST" 2>/dev/null || echo "")
+            echo "App.framework MinimumOSVersion: '$MIN_OS'"
+            if [[ -z "$MIN_OS" ]]; then
+              echo "[FIX] Injecting MinimumOSVersion=13.0"
+              /usr/libexec/PlistBuddy -c "Add :MinimumOSVersion string 13.0" "$APP_FW_PLIST"
+              cd "$TEMP_DIR" && zip -qr "$RUNNER_TEMP/fixed.ipa" . && cd -
+              mv "$RUNNER_TEMP/fixed.ipa" "$IPA_PATH"
+              echo "[OK] IPA repacked"
+            fi
+          fi
+          rm -rf "$TEMP_DIR"
+          echo "[OK] IPA versions verified: ${expect_name}+${expect_num}"
+
+      # ── Upload Artifact ──
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: Netsignory-ipa
+          path: build/ios/ipa/*.ipa
+          retention-days: 30
+
+      # ── Resolve concrete IPA path (glob breaks apple-actions ADM-ZIP) ──
+      - name: Resolve IPA path
+        if: inputs.build_mode == 'appstore' || inputs.build_mode == 'adhoc'
+        id: ipa
+        run: |
+          IPA_PATH=$(find build/ios/ipa -name '*.ipa' -type f | head -1)
+          if [[ -z "$IPA_PATH" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::No IPA found under build/ios/ipa"
+            exit 1
+          fi
+          echo "path=$IPA_PATH" >> "$GITHUB_OUTPUT"
+          echo "[OK] IPA: $IPA_PATH ($(wc -c < "$IPA_PATH" | tr -d ' ') bytes)"
+
+      # ── TestFlight via xcrun altool (do NOT use apple-actions appstore-api) ──
+      - name: Prepare App Store Connect API Key
+        if: inputs.build_mode == 'appstore'
+        id: api_key
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          APPSTORE_API_PRIVATE_KEY: ${{ secrets.APPSTORE_API_PRIVATE_KEY }}
+          APPSTORE_API_PRIVATE_KEY_BASE64: ${{ secrets.APPSTORE_API_PRIVATE_KEY_BASE64 }}
+        run: |
+          if [[ -z "${APPSTORE_API_KEY_ID:-}" || -z "${APPSTORE_ISSUER_ID:-}" ]]; then
+            echo "skip_upload=true" >> "$GITHUB_OUTPUT"
+            echo "[SKIP] API Key/Issuer not configured"
+            exit 0
+          fi
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          KEY_FILE="$KEY_DIR/AuthKey_${APPSTORE_API_KEY_ID}.p8"
+
+          if [[ -n "${APPSTORE_API_PRIVATE_KEY_BASE64:-}" ]]; then
+            echo "$APPSTORE_API_PRIVATE_KEY_BASE64" | base64 --decode > "$KEY_FILE"
+            echo "[OK] Key decoded from BASE64"
+          elif [[ -n "${APPSTORE_API_PRIVATE_KEY:-}" ]]; then
+            if echo "$APPSTORE_API_PRIVATE_KEY" | grep -q "BEGIN PRIVATE KEY"; then
+              printf '%s\n' "$APPSTORE_API_PRIVATE_KEY" > "$KEY_FILE"
+            else
+              {
+                echo "-----BEGIN PRIVATE KEY-----"
+                echo "$APPSTORE_API_PRIVATE_KEY" | tr -d '\n\r' | fold -w 64
+                echo "-----END PRIVATE KEY-----"
+              } > "$KEY_FILE"
+            fi
+            echo "[OK] Key written from text"
+          else
+            echo "skip_upload=true" >> "$GITHUB_OUTPUT"
+            echo "[SKIP] No API private key configured"
+            exit 0
+          fi
+          # Normalize PEM newlines
+          python3 -c "import pathlib; p=pathlib.Path(r'''$KEY_FILE'''); p.write_bytes(p.read_bytes().replace(b'\r\n',b'\n').replace(b'\r',b'\n').strip()+b'\n')"
+          chmod 600 "$KEY_FILE"
+          echo "skip_upload=false" >> "$GITHUB_OUTPUT"
+          echo "[OK] API key at $KEY_FILE ($(wc -c < "$KEY_FILE" | tr -d ' ') bytes)"
+
+      - name: Upload IPA with xcrun altool
+        if: inputs.build_mode == 'appstore' && steps.api_key.outputs.skip_upload != 'true'
+        env:
+          APPSTORE_API_KEY_ID: ${{ secrets.APPSTORE_API_KEY_ID }}
+          APPSTORE_ISSUER_ID: ${{ secrets.APPSTORE_ISSUER_ID }}
+          IPA_PATH: ${{ steps.ipa.outputs.path }}
+        run: |
+          set -euo pipefail
+          echo "════════════════════════════════════════"
+          echo " Upload backend: xcrun altool (NOT apple-actions)"
+          echo " IPA: $IPA_PATH"
+          echo " Version expected: ${{ steps.ver.outputs.name }}+${{ steps.ver.outputs.number }}"
+          echo " Commit: $(git rev-parse --short HEAD)"
+          echo "════════════════════════════════════════"
+          if [[ -z "$IPA_PATH" || ! -f "$IPA_PATH" ]]; then
+            echo "::error::IPA path missing"
+            exit 1
+          fi
+          # Final version dump from IPA before upload
+          TEMP_DIR=$(mktemp -d)
+          unzip -q "$IPA_PATH" -d "$TEMP_DIR"
+          echo "Runner CFBundleVersion=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$TEMP_DIR/Payload/Runner.app/Info.plist")"
+          echo "VPNTunnel CFBundleVersion=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$TEMP_DIR/Payload/Runner.app/PlugIns/VPNTunnel.appex/Info.plist" 2>/dev/null || echo n/a)"
+          rm -rf "$TEMP_DIR"
+
+          xcrun altool --upload-app \
+            --type ios \
+            --file "$IPA_PATH" \
+            --apiKey "$APPSTORE_API_KEY_ID" \
+            --apiIssuer "$APPSTORE_ISSUER_ID" \
+            --verbose
+          echo "[OK] altool upload finished"
+
+      # ── Cleanup ──
+      - name: Cleanup Keychain
+        if: always()
+        run: |
+          security delete-keychain $RUNNER_TEMP/app-signing.keychain-db 2>/dev/null || true
+          rm -f $RUNNER_TEMP/cert.p12 $RUNNER_TEMP/app.mobileprovision $RUNNER_TEMP/ext.mobileprovision
+          rm -f "$HOME/.appstoreconnect/private_keys/AuthKey_"*.p8 2>/dev/null || true
+
+      # ── Summary ──
+      - name: Build Summary
+        if: always()
+        run: |
+          echo "==========================================="
+          echo " iOS Build Complete"
+          echo " Mode:   ${{ inputs.build_mode || 'unsigned' }}"
+          echo " Xcode:  ${XCODE_VERSION}"
+          echo " SDK:    $(xcrun --sdk iphoneos --show-sdk-version)"
+          echo " Ver:    ${{ steps.ver.outputs.name }}+${{ steps.ver.outputs.number }}"
+          echo " Commit: $(git rev-parse --short HEAD)"
+          echo "==========================================="
