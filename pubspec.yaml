@@ -1,7 +1,7 @@
 name: vpn_client
 description: SD-WAN VPN client scaffold
 publish_to: none
-version: 0.1.1+100
+version: 0.1.1+101
 
 environment:
   sdk: ">=3.3.0 <4.0.0"
