@@ -272,15 +272,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         let nwParams = NWParameters(tls: tlsOptions, tcp: tcpOptions)
         // 全隧道默认路由生效后，未固定路径的 NWConnection 可能迁移进自身
         // Packet Tunnel，造成 CSTP 传输自环并表现为“已连接但国内外都断网”。
-        // 在创建连接时固定到启动前的物理接口。
+        // NEProvider.defaultPath 在部分 Xcode SDK 中是旧版 NWPath，没有
+        // usesInterfaceType；用 isExpensive 兼容判断蜂窝/非蜂窝网络。
         if let path = defaultPath {
-            if path.usesInterfaceType(.wifi) {
-                nwParams.requiredInterfaceType = .wifi
-            } else if path.usesInterfaceType(.cellular) {
-                nwParams.requiredInterfaceType = .cellular
-            } else if path.usesInterfaceType(.wiredEthernet) {
-                nwParams.requiredInterfaceType = .wiredEthernet
-            }
+            nwParams.requiredInterfaceType =
+                path.isExpensive ? .cellular : .wifi
         }
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(serverHost),
