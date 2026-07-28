@@ -277,7 +277,11 @@ import SystemConfiguration
             if let data = data, String(data: data, encoding: .utf8) == "ok" {
                 result(nil)
             } else {
-                result(nil)
+                result(FlutterError(
+                    code: "NETWORK_CONFIG_FAILED",
+                    message: "VPN 扩展应用网络配置失败",
+                    details: nil
+                ))
             }
         }
     }
@@ -287,7 +291,11 @@ import SystemConfiguration
             if let data = data, String(data: data, encoding: .utf8) == "ok" {
                 result(nil)
             } else {
-                result(nil)
+                result(FlutterError(
+                    code: "DEFAULT_ROUTE_FAILED",
+                    message: "VPN 扩展应用默认路由失败",
+                    details: nil
+                ))
             }
         }
     }

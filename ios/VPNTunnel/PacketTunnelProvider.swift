@@ -627,14 +627,21 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// 第一阶段：写入 DNS + 非默认路由（对齐安卓 `applyNetworkConfig`）。
-    private func handleApplyNetworkConfig(dns: [String], routes: [String], mtu: Int) {
+    private func handleApplyNetworkConfig(
+        dns: [String],
+        routes: [String],
+        mtu: Int,
+        completion: @escaping (Error?) -> Void
+    ) {
         if !dns.isEmpty { effectiveDns = dns }
         if !routes.isEmpty { effectiveRoutes = routes }
-        if mtu > 0 { cstpMtu = mtu }
+        // 不要用主 App 的默认值放大服务端协商 MTU，否则大包可能被 ASA 丢弃。
+        if mtu > 0 { cstpMtu = min(cstpMtu, mtu) }
 
         #if canImport(WireGuardKit)
         if wgStarted {
             updateWireGuardRoutes()
+            completion(nil)
             return
         }
         #endif
@@ -642,15 +649,17 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if let error = error {
                 os_log("applyNetworkConfig 失败: %{public}@", log: self?.log ?? .default, type: .error, "\(error)")
             }
+            completion(error)
         }
     }
 
     /// 第二阶段：追加默认路由，全流量走隧道（对齐安卓 `applyDefaultRoute`）。
-    private func handleApplyDefaultRoute() {
+    private func handleApplyDefaultRoute(completion: @escaping (Error?) -> Void) {
         fullTunnel = true
         #if canImport(WireGuardKit)
         if wgStarted {
             updateWireGuardRoutes()
+            completion(nil)
             return
         }
         #endif
@@ -658,6 +667,7 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             if let error = error {
                 os_log("applyDefaultRoute 失败: %{public}@", log: self?.log ?? .default, type: .error, "\(error)")
             }
+            completion(error)
         }
     }
 
@@ -720,8 +730,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
             completionHandler?((lastError ?? "").data(using: .utf8))
             return
         case "default_route":
-            handleApplyDefaultRoute()
-            completionHandler?("ok".data(using: .utf8))
+            handleApplyDefaultRoute { [weak self] error in
+                if let error = error {
+                    self?.lastError = "applyDefaultRoute failed: \(error)"
+                    completionHandler?("error".data(using: .utf8))
+                } else {
+                    completionHandler?("ok".data(using: .utf8))
+                }
+            }
             return
         default:
             break
@@ -735,8 +751,14 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 let dns = (json["dnsServers"] as? [String]) ?? []
                 let routes = (json["routes"] as? [String]) ?? []
                 let mtu = (json["mtu"] as? Int) ?? ((json["mtu"] as? NSNumber)?.intValue ?? 0)
-                handleApplyNetworkConfig(dns: dns, routes: routes, mtu: mtu)
-                completionHandler?("ok".data(using: .utf8))
+                handleApplyNetworkConfig(dns: dns, routes: routes, mtu: mtu) { [weak self] error in
+                    if let error = error {
+                        self?.lastError = "applyNetworkConfig failed: \(error)"
+                        completionHandler?("error".data(using: .utf8))
+                    } else {
+                        completionHandler?("ok".data(using: .utf8))
+                    }
+                }
                 return
             default:
                 break
