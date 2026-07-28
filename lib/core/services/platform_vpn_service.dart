@@ -173,7 +173,7 @@ class PlatformVpnService implements VpnService {
 
       String cookieHeader() => allCookies.values.join('; ');
 
-      // 第零步：与浏览器一致，先访问 group URL 并设置 tg Cookie
+      // 第零步：与浏览器一致，先从 group URL 进入（仅预取 Cookie，不强行改写 POST 字段）
       if (tunnelGroup.isNotEmpty) {
         final groupPathNorm =
             groupPath.startsWith('/') ? groupPath : '/$groupPath';
@@ -193,11 +193,14 @@ class PlatformVpnService implements VpnService {
           dev.log('CSTP group prefetch failed (continue): $e',
               name: 'PlatformVpnService');
         }
-        allCookies['tg'] = 'tg=${_asaTunnelGroupCookieValue(tunnelGroup)}';
-        dev.log('CSTP tunnel-group: $tunnelGroup', name: 'PlatformVpnService');
+        // 服务端未下发 tg 时，再按 ASA 登录页 JS 补一条
+        if (!allCookies.containsKey('tg')) {
+          allCookies['tg'] = 'tg=${_asaTunnelGroupCookieValue(tunnelGroup)}';
+        }
+        dev.log('CSTP group entry: $tunnelGroup', name: 'PlatformVpnService');
       }
 
-      // 第一步: GET 登录页面，提取 csrf_token
+      // 第一步: GET 登录页面，提取 csrf_token / 表单 hidden 字段
       final loginUrl = Uri.parse('$baseUrl/+CSCOE+/logon.html');
       final getReq = await client.getUrl(loginUrl);
       getReq.headers.set('User-Agent', 'AnyConnect');
@@ -215,6 +218,16 @@ class PlatformVpnService implements VpnService {
       ).firstMatch(html);
       final csrf = csrfMatch?.group(1) ?? '';
 
+      // 以登录页表单为准（浏览器 POST 也是用 hidden 字段，通常为空）
+      final formTgroupMatch = RegExp(
+        r'name="tgroup"\s+[^>]*value="([^"]*)"',
+      ).firstMatch(html);
+      final formTgroup = formTgroupMatch?.group(1) ?? '';
+      final formTgCookieSetMatch = RegExp(
+        r'name="tgcookieset"\s+[^>]*value="([^"]*)"',
+      ).firstMatch(html);
+      final formTgCookieSet = formTgCookieSetMatch?.group(1) ?? '';
+
       // 模拟页面 JavaScript 设置的 Cookie
       allCookies['webvpnlogin'] = 'webvpnlogin=1';
       if (csrf.isNotEmpty) {
@@ -223,11 +236,11 @@ class PlatformVpnService implements VpnService {
 
       dev.log(
         'CSTP login page: csrf=${csrf.isNotEmpty ? "found" : "missing"}, '
-        'tgroup=$tunnelGroup, cookies=${allCookies.keys.join(",")}',
+        'formTgroup="$formTgroup", cookies=${allCookies.keys.join(",")}',
         name: 'PlatformVpnService',
       );
 
-      // 第二步: POST 登录凭据（与 HTML 表单完全一致）
+      // 第二步: POST 登录凭据（与 HTML 表单 hidden 字段一致）
       final postUrl = Uri.parse('$baseUrl/+webvpn+/index.html');
       final postReq = await client.postUrl(postUrl);
       postReq.headers
@@ -237,9 +250,9 @@ class PlatformVpnService implements VpnService {
       postReq.headers.set('Cookie', cookieHeader());
 
       final formData = {
-        'tgroup': tunnelGroup,
+        'tgroup': formTgroup,
         'next': '',
-        'tgcookieset': tunnelGroup.isNotEmpty ? '1' : '',
+        'tgcookieset': formTgCookieSet,
         'csrf_token': csrf,
         'username': username,
         'password': password,
