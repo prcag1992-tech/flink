@@ -126,6 +126,21 @@ class PlatformVpnService implements VpnService {
     await _channel.invokeMethod('connect', params);
   }
 
+  /// 从节点 URL 路径解析 ASA tunnel-group（如 `/usipall` → `usipall`）。
+  static String tunnelGroupFromPath(String groupPath) {
+    var path = groupPath.trim();
+    if (path.isEmpty) return '';
+    if (!path.startsWith('/')) path = '/$path';
+    final segments =
+        path.split('/').where((s) => s.isNotEmpty).toList(growable: false);
+    return segments.isEmpty ? '' : segments.last;
+  }
+
+  /// ASA 登录页 JS：`document.cookie = "tg=1" + base64_encode(group)`.
+  static String _asaTunnelGroupCookieValue(String tunnelGroup) {
+    return '1${base64Encode(utf8.encode(tunnelGroup))}';
+  }
+
   /// Cisco AnyConnect/ASA Web 表单认证。
   /// 返回会话 Cookie 字符串（用于 CSTP CONNECT 请求），失败返回 null。
   Future<String?> _cstpAuthenticate({
@@ -140,16 +155,8 @@ class PlatformVpnService implements VpnService {
     client.connectionTimeout = const Duration(seconds: 10);
     try {
       final baseUrl = 'https://$host:$port';
+      final tunnelGroup = tunnelGroupFromPath(groupPath);
 
-      // 第一步: GET 登录页面，提取 csrf_token
-      final loginUrl = Uri.parse('$baseUrl/+CSCOE+/logon.html');
-      final getReq = await client.getUrl(loginUrl);
-      getReq.headers.set('User-Agent', 'AnyConnect');
-      getReq.followRedirects = false;
-      final getResp = await getReq.close().timeout(const Duration(seconds: 10));
-      final html = await utf8.decodeStream(getResp);
-
-      // 收集响应 Cookie
       final allCookies = <String, String>{};
       void collectCookies(HttpClientResponse resp) {
         final headers = resp.headers[HttpHeaders.setCookieHeader];
@@ -163,6 +170,43 @@ class PlatformVpnService implements VpnService {
           }
         }
       }
+
+      String cookieHeader() => allCookies.values.join('; ');
+
+      // 第零步：与浏览器一致，先访问 group URL 并设置 tg Cookie
+      if (tunnelGroup.isNotEmpty) {
+        final groupPathNorm =
+            groupPath.startsWith('/') ? groupPath : '/$groupPath';
+        final groupUrl = Uri.parse('$baseUrl$groupPathNorm');
+        try {
+          final groupReq = await client.getUrl(groupUrl);
+          groupReq.headers.set('User-Agent', 'AnyConnect');
+          groupReq.followRedirects = false;
+          if (allCookies.isNotEmpty) {
+            groupReq.headers.set('Cookie', cookieHeader());
+          }
+          final groupResp =
+              await groupReq.close().timeout(const Duration(seconds: 10));
+          await groupResp.drain<void>();
+          collectCookies(groupResp);
+        } catch (e) {
+          dev.log('CSTP group prefetch failed (continue): $e',
+              name: 'PlatformVpnService');
+        }
+        allCookies['tg'] = 'tg=${_asaTunnelGroupCookieValue(tunnelGroup)}';
+        dev.log('CSTP tunnel-group: $tunnelGroup', name: 'PlatformVpnService');
+      }
+
+      // 第一步: GET 登录页面，提取 csrf_token
+      final loginUrl = Uri.parse('$baseUrl/+CSCOE+/logon.html');
+      final getReq = await client.getUrl(loginUrl);
+      getReq.headers.set('User-Agent', 'AnyConnect');
+      getReq.followRedirects = false;
+      if (allCookies.isNotEmpty) {
+        getReq.headers.set('Cookie', cookieHeader());
+      }
+      final getResp = await getReq.close().timeout(const Duration(seconds: 10));
+      final html = await utf8.decodeStream(getResp);
       collectCookies(getResp);
 
       // 提取 csrf_token
@@ -179,7 +223,7 @@ class PlatformVpnService implements VpnService {
 
       dev.log(
         'CSTP login page: csrf=${csrf.isNotEmpty ? "found" : "missing"}, '
-        'cookies=${allCookies.keys.join(",")}',
+        'tgroup=$tunnelGroup, cookies=${allCookies.keys.join(",")}',
         name: 'PlatformVpnService',
       );
 
@@ -190,12 +234,12 @@ class PlatformVpnService implements VpnService {
           .set('Content-Type', 'application/x-www-form-urlencoded');
       postReq.headers.set('User-Agent', 'AnyConnect');
       postReq.followRedirects = false;
-      postReq.headers.set('Cookie', allCookies.values.join('; '));
+      postReq.headers.set('Cookie', cookieHeader());
 
       final formData = {
-        'tgroup': '',
+        'tgroup': tunnelGroup,
         'next': '',
-        'tgcookieset': '',
+        'tgcookieset': tunnelGroup.isNotEmpty ? '1' : '',
         'csrf_token': csrf,
         'username': username,
         'password': password,
