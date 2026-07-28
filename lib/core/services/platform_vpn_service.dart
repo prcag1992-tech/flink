@@ -126,21 +126,6 @@ class PlatformVpnService implements VpnService {
     await _channel.invokeMethod('connect', params);
   }
 
-  /// 从节点 URL 路径解析 ASA tunnel-group（如 `/usipall` → `usipall`）。
-  static String tunnelGroupFromPath(String groupPath) {
-    var path = groupPath.trim();
-    if (path.isEmpty) return '';
-    if (!path.startsWith('/')) path = '/$path';
-    final segments =
-        path.split('/').where((s) => s.isNotEmpty).toList(growable: false);
-    return segments.isEmpty ? '' : segments.last;
-  }
-
-  /// ASA 登录页 JS：`document.cookie = "tg=1" + base64_encode(group)`.
-  static String _asaTunnelGroupCookieValue(String tunnelGroup) {
-    return '1${base64Encode(utf8.encode(tunnelGroup))}';
-  }
-
   /// Cisco AnyConnect/ASA Web 表单认证。
   /// 返回会话 Cookie 字符串（用于 CSTP CONNECT 请求），失败返回 null。
   Future<String?> _cstpAuthenticate({
@@ -155,7 +140,6 @@ class PlatformVpnService implements VpnService {
     client.connectionTimeout = const Duration(seconds: 10);
     try {
       final baseUrl = 'https://$host:$port';
-      final tunnelGroup = tunnelGroupFromPath(groupPath);
 
       final allCookies = <String, String>{};
       void collectCookies(HttpClientResponse resp) {
@@ -173,44 +157,68 @@ class PlatformVpnService implements VpnService {
 
       String cookieHeader() => allCookies.values.join('; ');
 
-      // 第零步：与浏览器一致，先从 group URL 进入（仅预取 Cookie，不强行改写 POST 字段）
-      if (tunnelGroup.isNotEmpty) {
+      bool isSameGateway(Uri uri) =>
+          uri.scheme == 'https' && uri.host == host && uri.port == port;
+
+      /// ASA 的 group 入口先返回 JS 跳转，随后用 HTTP 302 下发真正的 tg Cookie。
+      /// 手动跟随才能在每一步收集 Set-Cookie；HttpClient 本身不维护 CookieJar。
+      Future<String> getFollowingRedirects(Uri initialUri) async {
+        var current = initialUri;
+        for (var redirectCount = 0; redirectCount <= 5; redirectCount++) {
+          if (!isSameGateway(current)) {
+            throw const FormatException('ASA redirect left the VPN gateway');
+          }
+          final request = await client.getUrl(current);
+          request.headers.set('User-Agent', 'AnyConnect');
+          request.followRedirects = false;
+          if (allCookies.isNotEmpty) {
+            request.headers.set('Cookie', cookieHeader());
+          }
+          final response =
+              await request.close().timeout(const Duration(seconds: 10));
+          collectCookies(response);
+
+          final location = response.headers.value(HttpHeaders.locationHeader);
+          if (response.isRedirect && location != null) {
+            await response.drain<void>();
+            current = current.resolve(location);
+            continue;
+          }
+          return utf8.decodeStream(response);
+        }
+        throw const FormatException('Too many ASA redirects');
+      }
+
+      // 第零步：访问节点入口（如 /usipall），解析 ASA 返回的 JS 组跳转。
+      var loginUrl = Uri.parse('$baseUrl/+CSCOE+/logon.html');
+      if (groupPath.trim().isNotEmpty) {
         final groupPathNorm =
             groupPath.startsWith('/') ? groupPath : '/$groupPath';
         final groupUrl = Uri.parse('$baseUrl$groupPathNorm');
         try {
-          final groupReq = await client.getUrl(groupUrl);
-          groupReq.headers.set('User-Agent', 'AnyConnect');
-          groupReq.followRedirects = false;
-          if (allCookies.isNotEmpty) {
-            groupReq.headers.set('Cookie', cookieHeader());
+          final groupHtml = await getFollowingRedirects(groupUrl);
+          final jsRedirect = RegExp(
+            r'''document\.location\.replace\(\s*['"]([^'"]+)['"]\s*\)''',
+          ).firstMatch(groupHtml);
+          final target = jsRedirect?.group(1);
+          if (target != null && target.isNotEmpty) {
+            final selectedLoginUrl = groupUrl.resolve(target);
+            if (!isSameGateway(selectedLoginUrl)) {
+              throw const FormatException(
+                  'ASA group selector redirected to another host');
+            }
+            loginUrl = selectedLoginUrl;
+            dev.log('CSTP group redirect: $groupPathNorm -> $target',
+                name: 'PlatformVpnService');
           }
-          final groupResp =
-              await groupReq.close().timeout(const Duration(seconds: 10));
-          await groupResp.drain<void>();
-          collectCookies(groupResp);
         } catch (e) {
-          dev.log('CSTP group prefetch failed (continue): $e',
+          dev.log('CSTP group selection failed (use default login): $e',
               name: 'PlatformVpnService');
         }
-        // 服务端未下发 tg 时，再按 ASA 登录页 JS 补一条
-        if (!allCookies.containsKey('tg')) {
-          allCookies['tg'] = 'tg=${_asaTunnelGroupCookieValue(tunnelGroup)}';
-        }
-        dev.log('CSTP group entry: $tunnelGroup', name: 'PlatformVpnService');
       }
 
-      // 第一步: GET 登录页面，提取 csrf_token / 表单 hidden 字段
-      final loginUrl = Uri.parse('$baseUrl/+CSCOE+/logon.html');
-      final getReq = await client.getUrl(loginUrl);
-      getReq.headers.set('User-Agent', 'AnyConnect');
-      getReq.followRedirects = false;
-      if (allCookies.isNotEmpty) {
-        getReq.headers.set('Cookie', cookieHeader());
-      }
-      final getResp = await getReq.close().timeout(const Duration(seconds: 10));
-      final html = await utf8.decodeStream(getResp);
-      collectCookies(getResp);
+      // 第一步：跟随 ?tgroup=... 的 302，让 ASA 下发正确 tg Cookie，再读取登录页。
+      final html = await getFollowingRedirects(loginUrl);
 
       // 提取 csrf_token
       final csrfMatch = RegExp(
