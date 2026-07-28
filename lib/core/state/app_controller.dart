@@ -139,23 +139,8 @@ class AppController extends ChangeNotifier {
   Future<String?> resolveServiceAddress(String address) async {
     if (address.trim().isEmpty) return _s.errFieldEmpty;
 
-    // 先检查网络可用性
-    try {
-      final result = await InternetAddress.lookup('dns.google')
-          .timeout(const Duration(seconds: 5));
-      if (result.isEmpty || result.first.rawAddress.isEmpty) {
-        return _s.errNetworkUnavailable;
-      }
-    } on SocketException {
-      return _s.errNetworkUnavailable;
-    } on TimeoutException {
-      return _s.errNetworkUnavailable;
-    } catch (_) {
-      // 查询失败，视为网络不可用
-      return _s.errNetworkUnavailable;
-    }
-
-    // 网络可用，再验证服务地址
+    // 直接验证服务接口；不要依赖 dns.google 判断网络，在国内或 VPN
+    // 残留路由场景下它可能不可达，从而误报“当前设备网络不可用”。
     try {
       final info = await _backendRepository.fetchLiInfo(liUrl: address.trim());
       if (info == null) return _s.errServiceNotFound;
@@ -299,33 +284,22 @@ class AppController extends ChangeNotifier {
     routeDownloadProgress = 0.0;
     notifyListeners();
 
-    // 本地网络连接检查（设置 isBusy 后执行，保持 loading 状态）
+    // 仅做诊断性解析，不再用 dns.google 或 DNS 失败阻断连接。
+    // 后续真实 API / VPN 请求会返回更准确的错误。
     if (!skipNetworkCheck) {
-    try {
-      final result = await InternetAddress.lookup('dns.google')
-          .timeout(const Duration(seconds: 5));
-      if (result.isEmpty || result[0].rawAddress.isEmpty) {
-        isBusy = false;
-        vpnStatus = VpnStatus.disconnected;
-        lastError = _s.errNetworkUnavailable;
-        notifyListeners();
-        return;
+      final endpoint = Uri.tryParse(node.url);
+      final host = endpoint?.host.isNotEmpty == true
+          ? endpoint!.host
+          : node.url.trim();
+      if (host.isNotEmpty && InternetAddress.tryParse(host) == null) {
+        try {
+          await InternetAddress.lookup(host)
+              .timeout(const Duration(seconds: 3));
+        } catch (e) {
+          dev.log('node DNS precheck failed, continue with real connect: $e',
+              name: 'AppController');
+        }
       }
-    } on SocketException {
-      isBusy = false;
-      vpnStatus = VpnStatus.disconnected;
-      lastError = _s.errNetworkUnavailable;
-      notifyListeners();
-      return;
-    } on TimeoutException {
-      isBusy = false;
-      vpnStatus = VpnStatus.disconnected;
-      lastError = _s.errNetworkUnavailable;
-      notifyListeners();
-      return;
-    } catch (_) {
-      // 无法确定网络状态，继续尝试连接
-    }
     }
 
     try {
@@ -426,8 +400,16 @@ class AppController extends ChangeNotifier {
         selectedNode = connectNode;
         selectedProtocol = protocol;
 
+        // iOS SSL 全隧道已在 CSTP 握手完成时使用服务端下发的 IP/DNS/MTU
+        // 和默认路由配置完毕。不要再通过 IPC 发送 1.7 万条路由并连续
+        // setTunnelNetworkSettings，否则会覆盖协商结果并造成“已连接但断网”。
+        final iosSslFullTunnel =
+            Platform.isIOS &&
+            protocol == VpnProtocol.ssl &&
+            !splitRoutingEnabled;
+
         // 写入 DNS + 非默认路由（所有协议通用）
-        if (networkConfig != null) {
+        if (networkConfig != null && !iosSslFullTunnel) {
           final effectiveConfig = _buildEffectiveNetworkConfig(
               protocol, connectNode, networkConfig!);
           dev.log(
@@ -458,7 +440,7 @@ class AppController extends ChangeNotifier {
         }
 
         // 全局模式（分流关闭）：添加默认路由，所有流量走 VPN
-        if (!splitRoutingEnabled) {
+        if (!splitRoutingEnabled && !iosSslFullTunnel) {
           try {
             await _vpnService.applyDefaultRoute();
             dev.log('applyDefaultRoute: default routes added',
