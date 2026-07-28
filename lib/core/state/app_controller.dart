@@ -439,8 +439,9 @@ class AppController extends ChangeNotifier {
           }
         }
 
-        // 全局模式（分流关闭）：添加默认路由，所有流量走 VPN
-        if (!splitRoutingEnabled && !iosSslFullTunnel) {
+        // 全局模式（分流关闭）：显式确认默认路由。iOS SSL 只跳过庞大的
+        // network-config 路由覆盖，但仍需在隧道就绪后补一次默认路由。
+        if (!splitRoutingEnabled) {
           try {
             await _vpnService.applyDefaultRoute();
             dev.log('applyDefaultRoute: default routes added',

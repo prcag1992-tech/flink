@@ -445,25 +445,41 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
     private func readOutbound() {
         packetFlow.readPackets { [weak self] packets, _ in
             guard let self = self, self.running, let conn = self.connection else { return }
-            if !packets.isEmpty {
-                var batch = Data()
-                batch.reserveCapacity(packets.reduce(0) { $0 + $1.count + 8 })
-                var total = 0
-                for packet in packets {
-                    let len = packet.count
-                    if len == 0 || len > 65535 { continue }
-                    batch.append(0x53); batch.append(0x54); batch.append(0x46); batch.append(0x01)
-                    batch.append(UInt8((len >> 8) & 0xFF)); batch.append(UInt8(len & 0xFF))
-                    batch.append(0x00); batch.append(0x00)
-                    batch.append(packet)
-                    total += len
-                }
-                if !batch.isEmpty {
-                    conn.send(content: batch, completion: .contentProcessed { _ in })
-                    self.txBytes += Int64(total)
-                }
+            var batch = Data()
+            batch.reserveCapacity(packets.reduce(0) { $0 + $1.count + 8 })
+            var total = 0
+            for packet in packets {
+                let len = packet.count
+                if len == 0 || len > 65535 { continue }
+                batch.append(0x53); batch.append(0x54); batch.append(0x46); batch.append(0x01)
+                batch.append(UInt8((len >> 8) & 0xFF)); batch.append(UInt8(len & 0xFF))
+                batch.append(0x00); batch.append(0x00)
+                batch.append(packet)
+                total += len
             }
-            if self.running { self.readOutbound() }
+
+            if batch.isEmpty {
+                if self.running { self.readOutbound() }
+                return
+            }
+
+            // 所有 NWConnection 写入都在 connQueue 串行执行，并在发送完成后
+            // 再读取下一批，避免浏览网页时大量并发 send 堆积或乱序。
+            let outboundBatch = batch
+            let outboundBytes = total
+            self.connQueue.async {
+                conn.send(content: outboundBatch, completion: .contentProcessed { [weak self] error in
+                    guard let self = self else { return }
+                    if let error = error {
+                        self.fail(&self.lastError, "CSTP_DATA_SEND_FAILED: \(error)")
+                        self.running = false
+                        conn.cancel()
+                        return
+                    }
+                    self.txBytes += Int64(outboundBytes)
+                    if self.running { self.readOutbound() }
+                })
+            }
         }
     }
 
