@@ -270,6 +270,18 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
         tcpOptions.noDelay = true
 
         let nwParams = NWParameters(tls: tlsOptions, tcp: tcpOptions)
+        // 全隧道默认路由生效后，未固定路径的 NWConnection 可能迁移进自身
+        // Packet Tunnel，造成 CSTP 传输自环并表现为“已连接但国内外都断网”。
+        // 在创建连接时固定到启动前的物理接口。
+        if let path = defaultPath {
+            if path.usesInterfaceType(.wifi) {
+                nwParams.requiredInterfaceType = .wifi
+            } else if path.usesInterfaceType(.cellular) {
+                nwParams.requiredInterfaceType = .cellular
+            } else if path.usesInterfaceType(.wiredEthernet) {
+                nwParams.requiredInterfaceType = .wiredEthernet
+            }
+        }
         let endpoint = NWEndpoint.hostPort(
             host: NWEndpoint.Host(serverHost),
             port: NWEndpoint.Port(integerLiteral: UInt16(serverPort))
@@ -474,6 +486,11 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                         self.fail(&self.lastError, "CSTP_DATA_SEND_FAILED: \(error)")
                         self.running = false
                         conn.cancel()
+                        self.cancelTunnelWithError(NSError(
+                            domain: "VPN",
+                            code: -24,
+                            userInfo: [NSLocalizedDescriptionKey: self.lastError ?? "CSTP data send failed"]
+                        ))
                         return
                     }
                     self.txBytes += Int64(outboundBytes)
@@ -493,8 +510,19 @@ class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.processInboundFrames()
             }
             if isComplete || error != nil {
-                os_log("Inbound 连接关闭", log: self.log, type: .info)
+                let detail = error.map { String(describing: $0) } ?? "EOF"
+                let message = "CSTP_INBOUND_CLOSED: \(detail)"
+                os_log("%{public}@", log: self.log, type: .error, message)
+                self.lastError = message
+                let wasRunning = self.running
                 self.running = false
+                if wasRunning {
+                    self.cancelTunnelWithError(NSError(
+                        domain: "VPN",
+                        code: -23,
+                        userInfo: [NSLocalizedDescriptionKey: message]
+                    ))
+                }
                 return
             }
             if self.running { self.receiveInbound() }
